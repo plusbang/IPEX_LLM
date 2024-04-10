@@ -63,7 +63,7 @@ def run_model_in_thread(model, in_out, tokenizer, result, warm_up, num_beams, in
             result[in_out].append([model.first_cost, model.rest_cost_mean, model.encoder_time,
                                    actual_in_len, actual_out_len, load_time, model.peak_memory])
 
-def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, num_trials=3, num_beams=1, low_bit='sym_int4', cpu_embedding=False, batch_size=1, streaming=False):
+def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, num_trials=3, num_beams=1, low_bit='sym_int4', cpu_embedding=False, batch_size=1, streaming=False, enable_xetla=False):
     # TODO: make a parameter
     result= {}
     if test_api == 'transformer_int4':
@@ -75,7 +75,7 @@ def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, 
     elif test_api == 'transformer_int4_gpu':
         result = run_transformer_int4_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'transformer_int4_fp16_gpu':
-        result = run_transformer_int4_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size, fp16=True)
+        result = run_transformer_int4_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size, fp16=True, enable_xetla=enable_xetla)
     elif test_api == 'optimize_model_gpu':
         result = run_optimize_model_gpu(repo_id, local_model_hub, in_out_pairs, warm_up, num_trials, num_beams, low_bit, batch_size)
     elif test_api == 'pytorch_autocast_bf16':
@@ -124,7 +124,8 @@ def run_model(repo_id, test_api, in_out_pairs, local_model_hub=None, warm_up=1, 
                             cpu_embedding if 'win' in test_api else 'N/A',
                             round(result[in_out_pair][-1][5], 2),
                             result[in_out_pair][-1][6] if any(keyword in test_api for keyword in ['int4_gpu', 'int4_fp16_gpu_win', 'int4_loadlowbit_gpu', 'fp16_gpu', 'deepspeed_optimize_model_gpu']) else 'N/A',
-                            streaming if 'win' in test_api else 'N/A'],
+                            streaming if 'win' in test_api else 'N/A',
+                            enable_xetla],
                             ) 
 
 
@@ -391,7 +392,8 @@ def run_transformer_int4_gpu(repo_id,
                              num_beams,
                              low_bit,
                              batch_size,
-                             fp16=False):
+                             fp16=False,
+                             enable_xetla=False):
     from ipex_llm.transformers import AutoModel, AutoModelForCausalLM
     from transformers import AutoTokenizer, GPTJForCausalLM, LlamaTokenizer
     import intel_extension_for_pytorch as ipex
@@ -410,7 +412,7 @@ def run_transformer_int4_gpu(repo_id,
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     elif origin_repo_id in LLAMA_IDS:
         model = AutoModelForCausalLM.from_pretrained(model_path, load_in_low_bit=low_bit, trust_remote_code=True,
-                                                     use_cache=True).eval()
+                                                     torch_dtype=torch.float16, enable_xetla=enable_xetla, use_cache=True).eval()
         tokenizer = LlamaTokenizer.from_pretrained(model_path, trust_remote_code=True)
     else:
         if "4bit" in repo_id:
@@ -1697,9 +1699,9 @@ if __name__ == '__main__':
                     if model_id_input in excludes or model_id_input_batch_size in excludes:
                         in_out_pairs.remove(in_out)
             run_model(model, api, in_out_pairs, conf['local_model_hub'], conf['warm_up'], conf['num_trials'], conf['num_beams'],
-                      conf['low_bit'], conf['cpu_embedding'], conf['batch_size'], streaming)
+                      conf['low_bit'], conf['cpu_embedding'], conf['batch_size'], streaming, conf['enable_xetla'])
         df = pd.DataFrame(results, columns=['model', '1st token avg latency (ms)', '2+ avg latency (ms/token)', 'encoder time (ms)',
                                             'input/output tokens', 'batch_size', 'actual input/output tokens', 'num_beams', 'low_bit', 'cpu_embedding',
-                                            'model loading time (s)', 'peak mem (GB)', 'streaming'])
+                                            'model loading time (s)', 'peak mem (GB)', 'streaming', 'enable_xetla'])
         df.to_csv(csv_name)
         results = []
