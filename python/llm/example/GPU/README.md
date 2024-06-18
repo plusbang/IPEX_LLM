@@ -16,6 +16,7 @@ This folder contains examples of running IPEX-LLM on Intel GPU:
 - [ModelScope-Models](ModelScope-Models): running ***ModelScope*** model with IPEX-LLM on Intel GPUs
 - [Long-Context](Long-Context): running **long-context** generation with IPEX-LLM on Intel Arc™ A770 Graphics.
 - [StableDiffusion](StableDiffusion): running **stable diffusion** with IPEX-LLM on Intel GPUs. 
+- [LLM-Patch-Inference](LLM-Patch-Inference): running inference on Intel GPU using Hugging Face code without modification
 
 
 ## System Support
