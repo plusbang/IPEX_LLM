@@ -49,7 +49,6 @@ def save_low_bit(self, model_dir: str, *args, **kwargs):
     kwargs["safe_serialization"] = False
     self.save_pretrained(model_dir, *args, **kwargs)
     import json
-    import os
 
     # We conveniently save all the keys of the model to have them on hand,
     # so that when using 'low_cpumem load',
@@ -79,6 +78,9 @@ class _BaseAutoModelClass:
                                 Relevant low bit optimizations will be applied to the model.
         :param optimize_model: boolean value, Whether to further optimize the low_bit llm model.
                                Default to be ``False``.
+        :param mixed_precision: boolean value, Whether to use mixed precision quantization.
+            Default to be False. If set to ``True``, we will use ``'sym_int8'`` for lm_head when
+            ``load_in_low_bit`` is '``sym_int4``' for certain models.
         :return: a model instance
         """
         if kwargs.get("device_map", None) not in [None, "cpu", "auto"]:
@@ -109,20 +111,21 @@ class _BaseAutoModelClass:
         ignore_argument(kwargs, "load_in_4bit")
         ignore_argument(kwargs, "load_in_8bit")
         ignore_argument(kwargs, "imatrix")
-        ignore_argument(kwargs, "mixed_precision")
         ignore_argument(kwargs, "cpu_embedding")
         ignore_argument(kwargs, "embedding_qtype")
         ignore_argument(kwargs, "enable_mp")
-        ignore_argument(kwargs, "modules_to_not_convert")
         ignore_argument(kwargs, "quantization_config")
         ignore_argument(kwargs, "speculative")
         ignore_argument(kwargs, "pipeline_parallel_stages")
         optimize_model = kwargs.pop("optimize_model", False)
         max_output_len = kwargs.pop("max_output_len", 1024)
+        max_output_len = max_output_len - 1
         max_prompt_len = kwargs.pop("max_prompt_len", 512)
         inter_pp = kwargs.pop("inter_pp", None)
         intra_pp = kwargs.pop("intra_pp", None)
         transpose_value_cache = kwargs.pop("transpose_value_cache", True)
+        modules_to_not_convert = kwargs.pop("modules_to_not_convert", [])
+        mixed_precision = kwargs.pop('mixed_precision', False)
 
         _args = copy.deepcopy(args)
         _kwargs = copy.deepcopy(kwargs)
@@ -152,29 +155,39 @@ class _BaseAutoModelClass:
             )
             from ipex_llm.transformers.npu_models.convert_mp import optimize_llm, optimize_llm_pre
 
+            if hasattr(model, "llm"):
+                llm = model.llm
+            else:
+                llm = model
+
             with torch.no_grad():
-                optimize_llm_pre(model, qtype)
-                cls.load_convert(qtype, model, "cpu", *args, **kwargs)
-                create_npu_kernels(model)
+                model.config.update({"mixed_precision": mixed_precision})
+                optimize_llm_pre(model, qtype, mixed_precision)
+                cls.load_convert(qtype, model, "cpu", modules_to_not_convert, *args, **kwargs)
+                create_npu_kernels(llm)
             model = model.eval()
             logger.info(f"Finish to convert model")
             model.config.update({"bigdl_transformers_low_bit": qtype})
             model.share_memory()
 
             optimize_llm(
-                model,
+                llm,
                 max_output_len=max_output_len,
                 max_prompt_len=max_prompt_len,
                 inter_pp=inter_pp,
                 intra_pp=intra_pp,
                 transpose_value_cache=transpose_value_cache,
             )
+            model.save_low_bit = types.MethodType(save_low_bit, model)
         else:
             from ipex_llm.transformers.npu_models.convert import optimize_llm
             optimize_llm(model)
             with torch.no_grad():
-                cls.load_convert(qtype, model, "cpu", *args, **kwargs)
-                create_npu_kernels(model)
+                cls.load_convert(qtype, model, "cpu", modules_to_not_convert, *args, **kwargs)
+                if hasattr(model, "llm"):
+                    create_npu_kernels(model.llm)
+                else:
+                    create_npu_kernels(model)
             model = model.eval()
             logger.info(f"Finish to convert model")
             model.config.update({"bigdl_transformers_low_bit": qtype})
@@ -184,26 +197,30 @@ class _BaseAutoModelClass:
         return model
 
     @classmethod
-    def load_convert(cls, q_k, optimize_model, device, *arg, **kwarg):
+    def load_convert(cls, q_k, optimize_model, device, modules_to_not_convert, *arg, **kwarg):
         from ipex_llm.transformers.npu_models.convert import replace_with_QuantizedLinear
 
-        replace_with_QuantizedLinear(optimize_model, q_k, device=device)
+        replace_with_QuantizedLinear(optimize_model, q_k, device=device,
+                                     modules_to_not_convert=modules_to_not_convert)
 
     @classmethod
     @patch("transformers.dynamic_module_utils.get_imports", patch_flash_attn_import)
     def load_low_bit(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
-        if kwargs.pop("torch_dtype", None) not in [None, "auto", torch.float]:
-            warnings.warn("`torch_dtype` will be ignored, `torch.float` will be used")
-
         # ignore following arguments
         ignore_argument(kwargs, "model_hub")
         ignore_argument(kwargs, "lightweight_bmm")
         ignore_argument(kwargs, "cpu_embedding")
         ignore_argument(kwargs, "embedding_qtype")
-        ignore_argument(kwargs, "optimize_model")
-        ignore_argument(kwargs, "modules_to_not_convert")
         ignore_argument(kwargs, "speculative")
         ignore_argument(kwargs, "pipeline_parallel_stages")
+        ignore_argument(kwargs, "mixed_precision")
+        optimize_model = kwargs.pop("optimize_model", False)
+        max_output_len = kwargs.pop("max_output_len", 1024)
+        max_prompt_len = kwargs.pop("max_prompt_len", 512)
+        inter_pp = kwargs.pop("inter_pp", None)
+        intra_pp = kwargs.pop("intra_pp", None)
+        transpose_value_cache = kwargs.pop("transpose_value_cache", True)
+        modules_to_not_convert = kwargs.pop("modules_to_not_convert", [])
 
         from transformers.models.auto.configuration_auto import AutoConfig
         from transformers.modeling_utils import no_init_weights, get_state_dict_dtype
@@ -246,6 +263,7 @@ class _BaseAutoModelClass:
         config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path)
         qtype = config_dict.pop("bigdl_transformers_low_bit", False)
         bigdl_lcmu_enabled = config_dict.pop("bigdl_lcmu_enabled", True)
+        mixed_precision = config_dict.pop("mixed_precision", False)
 
         invalidInputError(
             qtype,
@@ -257,7 +275,7 @@ class _BaseAutoModelClass:
         invalidInputError(
             qtype in ["sym_int8_rtn", "sym_int4_rtn"],
             f"Unknown bigdl_transformers_low_bit value: {qtype},"
-            f" expected: sym_int4, asym_int4, sym_int5, asym_int5 or sym_int8.",
+            f" expected: sym_int8_rtn, sym_int4_rtn. "
         )
 
         has_remote_code = hasattr(config, "auto_map") and cls.HF_Model.__name__ in config.auto_map
@@ -342,17 +360,38 @@ class _BaseAutoModelClass:
         logger.info(f"Converting model, it may takes up to several minutes ...")
         from intel_npu_acceleration_library.compiler import create_npu_kernels
 
-        with torch.no_grad():
-            optimize_llm(model)
-            cls.load_convert(qtype, model, quant_device, *model_args, **kwargs)
-            create_npu_kernels(model)
+        if optimize_model:
+            invalidInputError(
+                max_prompt_len < max_output_len,
+                (
+                    f"max_prompt_len ({max_prompt_len}) should be less"
+                    " than max_output_len ({max_output_len})"
+                ),
+            )
+            from ipex_llm.transformers.npu_models.convert_mp import optimize_llm_pre
 
-        model = model.eval()
+            if hasattr(model, "llm"):
+                llm = model.llm
+            else:
+                llm = model
+
+            with torch.no_grad():
+                optimize_llm_pre(model, qtype, mixed_precision)
+                cls.load_convert(qtype, model, quant_device, modules_to_not_convert,
+                                 *model_args, **kwargs)
+                create_npu_kernels(llm)
+
+        else:
+            from ipex_llm.transformers.npu_models.convert import optimize_llm
+            optimize_llm(model)
+            with torch.no_grad():
+                cls.load_convert(qtype, model, quant_device, modules_to_not_convert,
+                                 *model_args, **kwargs)
+                create_npu_kernels(model)
 
         if is_sharded:
             loaded_state_dict_keys = sharded_metadata["all_checkpoint_keys"]
         else:
-            import os
             import json
 
             with open(
@@ -364,6 +403,10 @@ class _BaseAutoModelClass:
         # restore default dtype
         if dtype_orig is not None:
             torch.set_default_dtype(dtype_orig)
+
+        # set tie_word_embeddings to False to avoid possible lm_head error
+        if hasattr(model.config, "tie_word_embeddings"):
+            model.config.tie_word_embeddings = False
 
         (
             model,
@@ -405,6 +448,17 @@ class _BaseAutoModelClass:
                 pass
         for param in model.parameters():
             param.requires_grad_(False)
+
+        if optimize_model:
+            from ipex_llm.transformers.npu_models.convert_mp import optimize_llm
+            optimize_llm(
+                llm,
+                max_output_len=max_output_len,
+                max_prompt_len=max_prompt_len,
+                inter_pp=inter_pp,
+                intra_pp=intra_pp,
+                transpose_value_cache=transpose_value_cache,
+            )
 
         return model
 

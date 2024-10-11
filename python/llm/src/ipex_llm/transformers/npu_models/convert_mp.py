@@ -16,7 +16,9 @@
 import os
 import torch
 import importlib
+import numpy as np
 from ipex_llm.transformers.low_bit_linear import LowBitLinear, FP4Params
+from ipex_llm.transformers.npu_models.lm_head import LMHeadLinear, SlicedLMHead
 
 
 def convert_forward(m, target_m, new_forward):
@@ -27,7 +29,7 @@ def convert_forward(m, target_m, new_forward):
         convert_forward(sub_m, target_m, new_forward)
 
 
-def optimize_llm_pre(model: torch.nn.Module, qtype):
+def optimize_llm_pre(model: torch.nn.Module, qtype, mixed_precision):
     if model.config.model_type == "baichuan":
         # process NormHead module in Baichuan2 7B
         if hasattr(model, 'lm_head') and model.lm_head is not None:
@@ -42,8 +44,65 @@ def optimize_llm_pre(model: torch.nn.Module, qtype):
             from ipex_llm.transformers.models.baichuan import pre_compute_inv_freq
             model.apply(pre_compute_inv_freq)
 
+    # MiniCPM-V 2.6 must put lm_head on CPU now
+    cpu_lm_head = (
+        (model.config.model_type == "minicpmv" and model.config.hidden_size == 3584 and
+         model.config.vocab_size == 151666)
+        or os.environ.get("IPEX_LLM_CPU_LM_HEAD", "0") != "0"
+    )
+
+    # workaround for MiniCPM-2B
+    if model.config.model_type == "minicpm" and model.config.num_hidden_layers == 40:
+        # 73440 is vocab_size of MiniCPM-1B
+        new_linear_0 = torch.nn.Linear(0, 0, bias=False)
+        new_weight_0 = torch.nn.Parameter(model.lm_head.weight[:73440, :], requires_grad=False)
+        new_linear_0.weight = new_weight_0
+        new_linear_0.in_features = new_weight_0.size(1)
+        new_linear_0.out_features = new_weight_0.size(0)
+        model.lm_head_0 = new_linear_0
+
+        new_linear_1 = torch.nn.Linear(0, 0, bias=False)
+        import torch.nn.functional as F
+        padded_weight = F.pad(model.lm_head.weight[73440:, :],
+                              (0, 0, 0, 73440*2 - model.config.vocab_size))
+        new_weight_1 = torch.nn.Parameter(padded_weight, requires_grad=False)
+        new_linear_1.weight = new_weight_1
+        new_linear_1.in_features = new_weight_1.size(1)
+        new_linear_1.out_features = new_weight_1.size(0)
+        model.lm_head_1 = new_linear_1
+        del model.lm_head
+
+    if model.config.model_type == "minicpmv" and hasattr(model, "llm"):
+        # MiniCPM-V
+        if model.config.hidden_size == 2304 and model.config.vocab_size == 122753:
+            # MiniCPM-V 2
+            model.llm.config.model_type = "minicpm"
+        elif model.config.hidden_size == 3584 and model.config.vocab_size == 151666:
+            # MiniCPM-V 2.6
+            model.llm.config.model_type = "qwen2"
+        elif model.config.hidden_size == 4096 and model.config.vocab_size == 128256:
+            # MiniCPM-V 2.5
+            model.llm.config.model_type = "llama"
+        model = model.llm
+
+    if model.config.model_type == "qwen2":
+        from ipex_llm.transformers.npu_models.qwen2_mp import split_mlp_down_proj
+        model.apply(split_mlp_down_proj)
+
+        # for Qwen2-7B-Insturct, divide lm_head into 14 parts
+        if model.config.hidden_size == 3584 and model.config.vocab_size == 152064 and \
+                not cpu_lm_head:
+            # Do not split lm_head and use sym_int8 instead when mixed_precison is True
+            is_split = (not mixed_precision) and qtype == "sym_int4_rtn"
+            split_num = 14 if is_split else 1
+            new_lm_head = SlicedLMHead(model.lm_head.weight, split_num=split_num,
+                                       bias=model.lm_head.bias)
+            del model.lm_head
+            model.lm_head = new_lm_head
+
     # lm_head to cpu optimization
-    if os.environ.get("IPEX_LLM_CPU_LM_HEAD", "1") != "0":
+    if cpu_lm_head:
+        # disable the optimization by default
         from ipex_llm.transformers.low_bit_linear import SYM_INT4, SYM_INT8
         if qtype == "sym_int4_rtn":
             lm_qtype = SYM_INT4
@@ -109,9 +168,7 @@ def optimize_llm(
         if intra_pp is None:
             intra_pp = 2
         if inter_pp is None:
-            inter_pp = 4 if model.config.intermediate_size == 18944 else 1
-        if model.config.intermediate_size == 18944:
-            transpose_value_cache = False
+            inter_pp = 2 if model.config.intermediate_size == 18944 else 1
 
         from ipex_llm.transformers.npu_models.qwen2_mp import gen_qwen2_fused_model_forward
         from ipex_llm.transformers.npu_models.qwen2_mp import DecodeRunner, PrefillRunner
@@ -137,6 +194,11 @@ def optimize_llm(
         from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
         from ipex_llm.transformers.npu_models.qwen2_mp import qwen2_casullm_forward
         convert_forward(model, Qwen2ForCausalLM, qwen2_casullm_forward)
+
+        # for Qwen2-7B-Insturct, divide lm_head into 14 parts
+        if model.config.hidden_size == 3584 and model.config.vocab_size == 152064 and \
+                isinstance(model.lm_head, SlicedLMHead):
+            model.lm_head.get_fused_lm_head()
     elif model.config.model_type == "minicpm":
         # for minicpm-1b
         if intra_pp is None:
@@ -174,6 +236,10 @@ def optimize_llm(
             prefill_runner=prefill_runner, decode_runner=decode_runner
         )
         convert_forward(model, module.MiniCPMModel, minicpm_model_forward)
+        if model.config.num_hidden_layers == 40:
+            # for minicpm-2b
+            from ipex_llm.transformers.npu_models.minicpm_mp import minicpm_casullm_forward
+            convert_forward(model, module.MiniCPMForCausalLM, minicpm_casullm_forward)
     elif model.config.model_type == "baichuan" and model.config.num_hidden_layers == 32:
         # for Baichuan2-7B
         if intra_pp is None:
