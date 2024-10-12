@@ -52,20 +52,54 @@ def module_optimization(func) -> torch.nn.Module:
     return wrapper
 
 
+def do_int_quantization(weight, num_bits=4):
+    def calculate_signed_scale(weight, num_bits=4):
+        level_high = 2 ** (num_bits - 1)
+        w_abs_min = torch.abs(torch.min(weight, dim=-1, keepdim=True)[0])
+        w_max = torch.max(weight, dim=-1, keepdim=True)[0]
+        scale = torch.where(w_abs_min >= w_max, w_abs_min, -w_max)
+        scale /= level_high
+        eps = torch.finfo(scale.dtype).eps
+        scale = torch.where(torch.abs(scale) < eps, eps, scale)
+        return scale
+    def calculate_quantized_weight(weight, scale, num_bits=4):
+        weight = weight.to(torch.float32)
+        scale = scale.to(torch.float32)
+        level_low = -(2 ** (num_bits - 1))
+        level_high = 2 ** (num_bits - 1) - 1
+        compressed_weights = weight / scale
+        compressed_weights = torch.round(compressed_weights)
+        compressed_weights = torch.clip(compressed_weights, level_low, level_high).to(torch.int8)
+        return compressed_weights
+    
+    weight = weight.to(torch.float32)
+    scale = calculate_signed_scale(weight,)
+    compressed_weights = calculate_quantized_weight(weight, scale,)
+    compressed_weights = compressed_weights.flatten().tolist()
+    qweights = []
+    for i in range(len(compressed_weights)//2):
+        qweights.append((compressed_weights[2 * i + 1] << 4) | (compressed_weights[2 * i] & 0xF))
+    qweights = torch.tensor(qweights, dtype=torch.int8).reshape(weight.shape[0], -1)
+    scale = scale.to(torch.float16)
+    return qweights, scale
+
+
 @module_optimization
 def replace_with_QuantizedLinear(layer, qtype, device, modules_to_not_convert):
     from ipex_llm.transformers.low_bit_linear import ggml_convert_qtype
     from ipex_llm.ggml.quantize import ggml_tensor_qtype
     iqtype = ggml_tensor_qtype[qtype]
     if isinstance(layer, torch.nn.Linear) and not hasattr(layer, "qtype"):
-        if qtype == "sym_int4_rtn":
-            # workaround for qwen2 & int4
-            if (layer.in_features == 3584 and layer.out_features == 152064) or \
-               (layer.in_features == 18944 and layer.out_features == 3584):
-                qtype = "sym_int8_rtn"
-                iqtype = ggml_tensor_qtype[qtype]
-        qweights, scale = ggml_convert_qtype(layer.weight.data.to(torch.float32),
-                                             iqtype, device=device)
+        # if qtype == "sym_int4_rtn":
+        #     # workaround for qwen2 & int4
+        #     if (layer.in_features == 3584 and layer.out_features == 152064) or \
+        #        (layer.in_features == 18944 and layer.out_features == 3584):
+        #         qtype = "sym_int8_rtn"
+        #         iqtype = ggml_tensor_qtype[qtype]
+        # qweights, scale = ggml_convert_qtype(layer.weight.data.to(torch.float32),
+        #                                      iqtype, device=device)
+        print(f'replacing....')
+        qweights, scale = do_int_quantization(layer.weight.data.to(torch.float32))
         return QuantizedLinear(qweights, scale, layer.bias)
 
 
@@ -110,21 +144,25 @@ def optimize_llm(model: torch.nn.Module):
         convert_forward(model, MistralMLP, mistral_mlp_forward)
 
     elif model.config.model_type == "qwen2":
-        from ipex_llm.transformers.npu_models.qwen2 import merge_qkv
-        from ipex_llm.transformers.npu_models.qwen2 import merge_mlp
-        model.apply(merge_qkv)
-        model.apply(merge_mlp)
-
-        from ipex_llm.transformers.npu_models.qwen2 import qwen2_model_forward
-        from ipex_llm.transformers.npu_models.qwen2 import qwen2_attention_forward
-        from ipex_llm.transformers.npu_models.qwen2 import qwen2_mlp_forward
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2SdpaAttention
+        from ipex_llm.transformers.npu_models.qwen2_mp import split_mlp_down_proj, split_mlp_forward
+        model.apply(split_mlp_down_proj)
         from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
-        convert_forward(model, Qwen2Model, qwen2_model_forward)
-        convert_forward(model, Qwen2Attention, qwen2_attention_forward)
-        convert_forward(model, Qwen2SdpaAttention, qwen2_attention_forward)
-        convert_forward(model, Qwen2MLP, qwen2_mlp_forward)
+        convert_forward(model, Qwen2MLP, split_mlp_forward)
+        # from ipex_llm.transformers.npu_models.qwen2 import merge_qkv
+        # from ipex_llm.transformers.npu_models.qwen2 import merge_mlp
+        # model.apply(merge_qkv)
+        # model.apply(merge_mlp)
+
+        # from ipex_llm.transformers.npu_models.qwen2 import qwen2_model_forward
+        # from ipex_llm.transformers.npu_models.qwen2 import qwen2_attention_forward
+        # from ipex_llm.transformers.npu_models.qwen2 import qwen2_mlp_forward
+        # from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+        # from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2SdpaAttention
+        # from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+        # convert_forward(model, Qwen2Model, qwen2_model_forward)
+        # convert_forward(model, Qwen2Attention, qwen2_attention_forward)
+        # convert_forward(model, Qwen2SdpaAttention, qwen2_attention_forward)
+        # convert_forward(model, Qwen2MLP, qwen2_mlp_forward)
 
     elif model.config.model_type == "minicpm":
         from ipex_llm.transformers.npu_models.minicpm import merge_qkv

@@ -28,9 +28,114 @@ import torch
 from torch.nn import Parameter
 import uuid
 import math
-from intel_npu_acceleration_library.backend import run_matmul
+# from intel_npu_acceleration_library.backend import run_matmul
 from typing import Optional, Union
 from ipex_llm.utils.common import invalidInputError
+
+from intel_npu_acceleration_library.backend.runtime import set_contiguous, adapt_output_tensor
+from intel_npu_acceleration_library.backend import Linear, QLinear
+from intel_npu_acceleration_library.backend import MatMul, QMatMul
+from typing import Optional, Any, List, Dict, Deque, Union
+from intel_npu_acceleration_library.backend import NNFactory
+from torch.profiler import record_function
+from functools import partial
+from collections import deque
+import numpy as np
+
+_model_cache: Dict[str, Deque[NNFactory]] = {}
+
+@torch.no_grad()
+def run_matmul(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    op_id: Optional[str] = None,
+) -> torch.Tensor:
+    """Run a matmul operation. Depending on the datatype of the weights it runs a float or quantized operation.
+
+    Args:
+        x (torch.Tensor): Activation tensor. Its dtype must be torch.float16
+        weights (torch.Tensor): Weights tensor.  Its dtype can be torch.float16 or torch.int8
+        scale (Optional[torch.Tensor], optional): Quantization scale. If weights.dtype == torch.int8 then it must be set. Defaults to None.
+        op_id (Optional[str], optional): Operation ID. Defaults to None.
+
+    Raises:
+        RuntimeError: Unsupported weights datatype. Supported types: [torch.float16, torch.int8]
+
+    Returns:
+        torch.Tensor: result
+    """
+    global _model_cache
+
+    outC, inC = weights.shape[-2:]
+
+    inC *= 2
+
+    # Set tensors as contiguous in memory
+    x = set_contiguous(x)
+    weights = set_contiguous(weights)
+    if len(weights.shape) > 2:
+        weights = weights.view([-1, weights.shape[-1]])
+
+    if weights.dtype.is_floating_point:
+        op_class = Linear if op_id is not None else MatMul
+        op_class_name = op_class.__name__
+        create_op = partial(op_class)
+        op_args = [weights.numpy()]
+    elif weights.dtype in (torch.int8, torch.uint8):
+        if scale is None:
+            raise RuntimeError("Quantized weights require a not null scale")
+        op_class = QLinear if op_id is not None else QMatMul
+        op_class_name = op_class.__name__
+        np_dtype = np.int8 if weights.dtype == torch.int8 else np.uint8
+        create_op = partial(op_class, dtype=np_dtype)
+        if scale is None:
+            raise RuntimeError(
+                f"Quantized matmul (weights dtype == {weights.dtype}) requires scale (scale = {scale})"
+            )
+        op_args = [weights.numpy(), scale.numpy()]
+    else:
+        raise RuntimeError(f"Unsupported dtype for weights {weights.dtype}")
+
+    if not x.dtype.is_floating_point:
+        raise RuntimeError(f"Unsupported dtype for activation {x.dtype}")
+
+    # Use or not op_id depending on the class used
+    op_kwargs = {"op_id": op_id} if op_id else {}
+
+    original_input_shape = x.shape
+    expected_output_shape = list(original_input_shape[:-1]) + [outC]
+
+    if not (len(x.shape) >= 2):
+        raise RuntimeError(f"Input shape {x.shape} must me >= 2")
+
+    # Reshape input
+    input_dtype = x.dtype
+    x = x.to(torch.float16) if input_dtype != torch.float16 else x
+    if len(x.shape) > 2 or x.shape[-1] != inC:
+        x = x.view([-1, inC])
+    x_np = x.numpy()
+
+    batch = x_np.shape[0]
+
+    key = f"{str(op_class_name)}_{batch}_{inC}_x_{outC}_{inC}_{x_np.dtype}"
+    models = _model_cache.get(key, None)
+
+    if models is None:
+        _model_cache[key] = deque([create_op(inC, outC, batch)])
+    elif len(models) < 1:
+        _model_cache[key].append(create_op(inC, outC, batch))
+    else:
+        _model_cache[key].rotate(1)
+
+    # Get the model
+    model = _model_cache[key][0]
+
+    profiling_name = "matvec" if batch == 1 else "matmul"
+    with record_function(f"npu_{profiling_name}_{key}"):
+        ret = model.run(x_np, *op_args, **op_kwargs)
+
+    return adapt_output_tensor(ret, expected_output_shape, input_dtype)
 
 
 class Linear(torch.nn.Module):
@@ -122,6 +227,82 @@ class Linear(torch.nn.Module):
                               f"NPU do not support yet the requeste datatype: {dtype}")
 
 
+# class QuantizedLinear(torch.nn.Module):
+#     """Torch Quantized Linear operation NPU backend."""
+
+#     def __init__(
+#         self,
+#         weight: torch.Tensor,
+#         scale: torch.Tensor,
+#         bias: Optional[torch.Tensor] = None,
+#     ):
+#         """Initialize the QuantizedLinear class.
+
+#         Args:
+#             weight (torch.Tensor): Linear operation weight
+#             scale (torch.Tensor): Quantization scale
+#             bias (Optional[torch.Tensor], optional): Linear operation optional bias.
+#                                                      Defaults to None.
+
+#         Raises:
+#             RuntimeError: Quantized weight must be in torch.int8 format
+#         """
+#         super().__init__()
+
+#         self.weight = Parameter(weight, requires_grad=False).contiguous()
+#         if self.weight.dtype not in (torch.int8, torch.uint8):
+#             invalidInputError(
+#                 False,
+#                 (
+#                     f"Quantized weight must be in torch.(u)int8"
+#                     " dtype instead of {self.weight.dtype}"
+#                 )
+#             )
+#         self.outC, self.inC = self.weight.shape
+#         if self.weight.dtype == torch.uint8:
+#             # In case is Int4 we need to double the input channels because weights are compressed
+#             self.inC *= 2
+#         self.scale = Parameter(scale * math.sqrt(self.inC), requires_grad=False)
+#         self.bias = bias
+#         self.op_id = str(uuid.uuid4())
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """Torch module forward method.
+
+#         Args:
+#             x (torch.Tensor): Input tensor
+
+#         Raises:
+#             RuntimeError: Training is not supported for QuantizedLinear layer.
+#                           Use `.eval()` to do inference only
+
+#         Returns:
+#             torch.Tensor: result
+#         """
+
+#         # we assume a Linear is lm_head when its out_features > 30000,
+#         # if out_features > 100000, enable lm_head optimization automatically
+#         if x.size(1) > 500 and (
+#             (self.outC > 100_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") != "0") or
+#             (self.outC > 30_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") == "1")
+#         ):
+#             x = x[:, -1:, :]
+#         if self.training:
+#             invalidInputError(
+#                 False,
+#                 (
+#                     "Training is not supported for QuantizedLinear layer."
+#                     "Use `.eval()` to do inference only"
+#                 )
+#             )
+
+#         out = run_matmul(x, self.weight.data, self.scale.data, self.op_id)
+
+#         if self.bias is None:
+#             return out
+#         return out + self.bias
+
+
 class QuantizedLinear(torch.nn.Module):
     """Torch Quantized Linear operation NPU backend."""
 
@@ -144,22 +325,28 @@ class QuantizedLinear(torch.nn.Module):
         """
         super().__init__()
 
-        self.weight = Parameter(weight, requires_grad=False).contiguous()
-        if self.weight.dtype not in (torch.int8, torch.uint8):
-            invalidInputError(
-                False,
-                (
-                    f"Quantized weight must be in torch.(u)int8"
-                    " dtype instead of {self.weight.dtype}"
-                )
-            )
-        self.outC, self.inC = self.weight.shape
-        if self.weight.dtype == torch.uint8:
-            # In case is Int4 we need to double the input channels because weights are compressed
-            self.inC *= 2
-        self.scale = Parameter(scale * math.sqrt(self.inC), requires_grad=False)
+        high_4bits = weight >> 4
+        low_4bits = (weight << 4) >> 4
+        combined_weight = torch.cat((low_4bits.unsqueeze(2), high_4bits.unsqueeze(2)), dim=2)
+        decompressed_weight = combined_weight.view(combined_weight.size(0), -1)
+        dequantized_weight = decompressed_weight.to(torch.float32) * scale
+        self.weight = Parameter(dequantized_weight, requires_grad=False).contiguous()
+
+        # self.weight = Parameter(weight, requires_grad=False).contiguous()
+        # if self.weight.dtype not in (torch.int8, torch.uint8):
+        #     invalidInputError(
+        #         False,
+        #         (
+        #             f"Quantized weight must be in torch.(u)int8"
+        #             " dtype instead of {self.weight.dtype}"
+        #         )
+        #     )
+        # self.outC, self.inC = self.weight.shape
+        # self.inC *= 2
+        # self.scale = Parameter(scale, requires_grad=False).contiguous()
         self.bias = bias
-        self.op_id = str(uuid.uuid4())
+        # self.op_id = str(uuid.uuid4())
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Torch module forward method.
@@ -177,21 +364,23 @@ class QuantizedLinear(torch.nn.Module):
 
         # we assume a Linear is lm_head when its out_features > 30000,
         # if out_features > 100000, enable lm_head optimization automatically
-        if x.size(1) > 500 and (
-            (self.outC > 100_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") != "0") or
-            (self.outC > 30_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") == "1")
-        ):
-            x = x[:, -1:, :]
-        if self.training:
-            invalidInputError(
-                False,
-                (
-                    "Training is not supported for QuantizedLinear layer."
-                    "Use `.eval()` to do inference only"
-                )
-            )
+        # if x.size(1) > 500 and (
+        #     (self.outC > 100_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") != "0") or
+        #     (self.outC > 30_000 and os.environ.get("IPEX_LLM_LAST_LM_HEAD") == "1")
+        # ):
+        #     x = x[:, -1:, :]
+        # if self.training:
+        #     invalidInputError(
+        #         False,
+        #         (
+        #             "Training is not supported for QuantizedLinear layer."
+        #             "Use `.eval()` to do inference only"
+        #         )
+        #     )
 
-        out = run_matmul(x, self.weight.data, self.scale.data, self.op_id)
+        # out = run_matmul(x, self.weight.data, self.scale.data, self.op_id)
+
+        out = torch.matmul(x.to(torch.float32), torch.transpose(self.weight.data, 0, 1))
 
         if self.bias is None:
             return out
