@@ -53,6 +53,7 @@ def run_model(
     # Reshape input
     input_dtype = x[0].dtype
     x_np = [set_contiguous(elem).to(torch.float16).numpy() for elem in x]
+    x_np[1] = x_np[1].astype(np.int64)
     x_np[2] = x_np[2].astype(np.int64)
     op_args = []
     op_args_flatten = []
@@ -207,6 +208,7 @@ class LLMBaseNNFactory(NNFactory):
         attn_weight = self.matmul(query_states, key_states, False, True) / (
             math.sqrt(head_dim)
         )
+        attention_mask = self.convert_to_fp16(attention_mask)
         attn_weight = self.eltwise_add(attn_weight, attention_mask)
         attn_weight = self.convert_to_fp32(attn_weight)
         attn_weight = self.softmax(attn_weight, -1)
@@ -402,6 +404,7 @@ class LLMBaseNNFactory(NNFactory):
     @staticmethod
     def run_decoders(inputs, decoders, models_ptr=None):
         x_np = [elem.to(torch.float16).numpy() for elem in inputs]
+        x_np[1] = x_np[1].astype(np.int64)
         x_np[2] = x_np[2].astype(np.int64)
 
         num_decoders = len(decoders)
