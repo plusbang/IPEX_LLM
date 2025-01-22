@@ -402,42 +402,54 @@ def convert_fused_llama_layer(model, fused_layers, n_splits_linear, n_splits_dow
             input_layer_norm_weights.append(layer_norm_0)
             post_attn_layernorm_weights.append(layer_norm_1)
 
-            # save weight
-            input_lm_bin_file = os.path.join(weight_dir, f"model_{layer_idx}_input_3.bin")
-            post_lm_bin_file = os.path.join(weight_dir, f"model_{layer_idx}_input_4.bin")
-            layer_norm_0.data.numpy().tofile(input_lm_bin_file)
-            layer_norm_1.data.numpy().tofile(post_lm_bin_file)
-            st_idx = 5
-            # 6, 7 are past k/v
-            if not asym:
-                for idx, (weight, scale) in enumerate(weights):
-                    bin_file = os.path.join(weight_dir,
-                                            f"model_{layer_idx}_input_{st_idx+idx*2}.bin")
-                    weight.numpy().tofile(bin_file)
-                    bin_file = os.path.join(weight_dir,
-                                            f"model_{layer_idx}_input_{st_idx+idx*2+1}.bin")
-                    scale.numpy().tofile(bin_file)
-            else:
-                for idx, (weight, scale, zero) in enumerate(weights):
-                    bin_file = os.path.join(weight_dir,
-                                            f"model_{layer_idx}_input_{st_idx+idx*3}.bin")
-                    weight.numpy().tofile(bin_file)
-                    bin_file = os.path.join(weight_dir,
-                                            f"model_{layer_idx}_input_{st_idx+idx*3+1}.bin")
-                    scale.numpy().tofile(bin_file)
-                    bin_file = os.path.join(weight_dir,
-                                            f"model_{layer_idx}_input_{st_idx+idx*3+2}.bin")
-                    zero.numpy().tofile(bin_file)
+            if mode == "decode":
+                # save weight
+                input_lm_bin_file = os.path.join(weight_dir, f"model_{layer_idx}_input_3.bin")
+                post_lm_bin_file = os.path.join(weight_dir, f"model_{layer_idx}_input_4.bin")
+                layer_norm_0.data.numpy().tofile(input_lm_bin_file)
+                layer_norm_1.data.numpy().tofile(post_lm_bin_file)
+                st_idx = 5
+                # 6, 7 are past k/v
+                if not asym:
+                    for idx, (weight, scale) in enumerate(weights):
+                        bin_file = os.path.join(weight_dir,
+                                                f"model_{layer_idx}_input_{st_idx+idx*2}.bin")
+                        weight.numpy().tofile(bin_file)
+                        bin_file = os.path.join(weight_dir,
+                                                f"model_{layer_idx}_input_{st_idx+idx*2+1}.bin")
+                        scale.numpy().tofile(bin_file)
+                else:
+                    for idx, (weight, scale, zero) in enumerate(weights):
+                        bin_file = os.path.join(weight_dir,
+                                                f"model_{layer_idx}_input_{st_idx+idx*3}.bin")
+                        weight.numpy().tofile(bin_file)
+                        bin_file = os.path.join(weight_dir,
+                                                f"model_{layer_idx}_input_{st_idx+idx*3+1}.bin")
+                        scale.numpy().tofile(bin_file)
+                        bin_file = os.path.join(weight_dir,
+                                                f"model_{layer_idx}_input_{st_idx+idx*3+2}.bin")
+                        zero.numpy().tofile(bin_file)
 
         if isinstance(weights[0], tuple):
             np_dtype = np.int8 if weights[0][0].dtype == torch.int8 else np.uint8
         else:  # FP16 Linear
             np_dtype = np.float16
+        
+        if mode == "decode":
+            input_len = 1
+            decoder_name = f"decoder_layer_{i}"
+            npu_dpu_groups = None
+            keep_position_ids = True
+        else:
+            input_len = kv_len
+            decoder_name = "decoder_layer_prefill"
+            npu_dpu_groups = 6
+            keep_position_ids = False
 
         fused_decoder = LowBitLlamaMultiDecoderlayer(
-            [1, 1, num_heads * head_dim],
-            input_layernorm_weights=input_layer_norm_weights,
-            post_attn_layernorm_weights=post_attn_layernorm_weights,
+            [1, input_len, num_heads * head_dim],
+            input_layernorm_weights=input_layer_norm_weights if mode=="decode" else None,
+            post_attn_layernorm_weights=post_attn_layernorm_weights if mode=="decode" else None,
             cached_cos=cached_cos,
             cached_sin=cached_sin,
             num_heads=num_heads,
@@ -452,11 +464,17 @@ def convert_fused_llama_layer(model, fused_layers, n_splits_linear, n_splits_dow
             n_splits_linear=n_splits_linear,
             n_splits_down_proj=n_splits_down_proj,
             group_size=group_size,
+            cos_len=input_len,
+            keep_position_ids=keep_position_ids,
             asym=asym
         )
         update_names_of_IR_and_export_blob(fused_decoder,
-                                           f"decoder_layer_{i}",
+                                           decoder_name,
                                            save_dir,
                                            compile_blob=True,
-                                           keep_ir=False)
+                                        #    keep_ir=False,
+                                           keep_ir=True,
+                                           npu_dpu_groups=npu_dpu_groups)
+        if mode == "prefill":
+            break
     return 0

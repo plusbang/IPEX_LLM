@@ -516,6 +516,7 @@ def convert_llm_for_deploy(model: torch.nn.Module,
                 embedding_post = True
                 cos_sin_input = True
             fused_layers = len(model.model.layers) if fuse_layers is None else fuse_layers
+        prefill_fused_layer_num = 2
         update_dict = {"kv_len": kv_len,
                        "num_head": model.model.layers[0].self_attn.num_heads,
                        "head_dim": model.model.layers[0].self_attn.head_dim,
@@ -524,6 +525,7 @@ def convert_llm_for_deploy(model: torch.nn.Module,
                        "layernorm_const": layernorm_const,
                        "group_size":  group_size,
                        "fused_layers": fused_layers,
+                       "prefill_fused_layer_num": prefill_fused_layer_num,
                        "qkv_bias": False,
                        "use_prefill_sdp": use_prefill_sdp,
                        "weight_num": 7,
@@ -546,14 +548,18 @@ def convert_llm_for_deploy(model: torch.nn.Module,
                                   save_directory, weight_dir, transpose_value_cache, kv_len,
                                   group_size, layernorm_const, "decode")
         # save blob of single prefill layer
-        convert_llama_layer(model, 0, n_splits_linear, n_splits_down_proj,
-                            save_directory, weight_dir, transpose_value_cache, max_prompt_len,
-                            group_size, layernorm_const, "prefill")
+        convert_fused_llama_layer(model, len(model.model.layers) // prefill_fused_layer_num, n_splits_linear, n_splits_down_proj,
+                                  save_directory, weight_dir, transpose_value_cache, max_prompt_len,
+                                  group_size, layernorm_const, "prefill")
+        # convert_llama_layer(model, 0, n_splits_linear, n_splits_down_proj,
+        #                     save_directory, weight_dir, transpose_value_cache, max_prompt_len,
+        #                     group_size, layernorm_const, "prefill")
     elif model.config.model_type == "minicpm":
         if group_size == 0:
             fused_layers = 4 if fuse_layers is None else fuse_layers
         else:
             fused_layers = len(model.model.layers) if fuse_layers is None else fuse_layers
+        prefill_fused_layer_num = 2
         update_dict = {"kv_len": kv_len,
                        "num_head": model.model.layers[0].self_attn.num_heads,
                        "head_dim": model.model.layers[0].self_attn.head_dim,
@@ -562,6 +568,7 @@ def convert_llm_for_deploy(model: torch.nn.Module,
                        "layernorm_const": layernorm_const,
                        "group_size":  group_size,
                        "fused_layers": fused_layers,
+                       "prefill_fused_layer_num": prefill_fused_layer_num,
                        "qkv_bias": False,
                        "use_prefill_sdp": False,
                        "weight_num": 7,
@@ -579,9 +586,12 @@ def convert_llm_for_deploy(model: torch.nn.Module,
                                     save_directory, weight_dir, transpose_value_cache, kv_len,
                                     group_size, layernorm_const, "decode")
         # save blob of single prefill layer
-        convert_minicpm_layer(model, 0, n_splits_linear, n_splits_down_proj,
-                              save_directory, weight_dir, transpose_value_cache, max_prompt_len,
-                              group_size, layernorm_const, "prefill")
+        convert_fused_minicpm_layer(model, len(model.model.layers) // prefill_fused_layer_num, n_splits_linear, n_splits_down_proj,
+                                    save_directory, weight_dir, transpose_value_cache, max_prompt_len,
+                                    group_size, layernorm_const, "prefill")
+        # convert_minicpm_layer(model, 0, n_splits_linear, n_splits_down_proj,
+        #                       save_directory, weight_dir, transpose_value_cache, max_prompt_len,
+        #                       group_size, layernorm_const, "prefill")
         # save blob of lmhead and bin of embedding and embedding_post
         convert_lm_head_and_embedding(model, n_splits_linear,
                                       save_directory, weight_dir,
