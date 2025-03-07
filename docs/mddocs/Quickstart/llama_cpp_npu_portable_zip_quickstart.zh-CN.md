@@ -65,6 +65,10 @@ IPEX-LLM 提供了 llama.cpp 的相关支持以在 Intel NPU 上运行 GGUF 模�
 llama-cli-npu.exe -m DeepSeek-R1-Distill-Qwen-7B-Q6_K.gguf -n 32 --prompt "What is AI?"
 ```
 
+> [!Note]
+> 
+> - 目前支持的输入token数上限是960，输入和输出总token数上限是1024。
+
 ## 故障排除
 
 ### `L0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT, code 0x78000004` 报错

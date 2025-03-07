@@ -65,6 +65,10 @@ You could then use cli tool to run GGUF models on Intel NPU through running `lla
 llama-cli-npu.exe -m DeepSeek-R1-Distill-Qwen-7B-Q6_K.gguf -n 32 --prompt "What is AI?"
 ```
 
+> [!Note]
+> 
+> - The supported maximum number of input tokens is 960, and maximum sequence length for both input and output tokens is 1024 currently.
+
 ## Troubleshooting
 
 ### `L0 pfnCreate2 result: ZE_RESULT_ERROR_INVALID_ARGUMENT, code 0x78000004` error
